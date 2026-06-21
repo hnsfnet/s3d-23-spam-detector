@@ -30,6 +30,7 @@ from database import PredictionDatabase, VALID_LABELS
 
 DATA_DIR = os.environ.get("SPAM_DATA_DIR", "data")
 DB_PATH = os.environ.get("SPAM_DB_PATH", "spam_predictions.db")
+MODEL_PATH = os.environ.get("SPAM_MODEL_PATH", "spam_model.joblib")
 # Number of new, unapplied feedback records that trigger an automatic
 # retraining so the model "learns" from user corrections.
 FEEDBACK_RETRAIN_THRESHOLD = 50
@@ -71,6 +72,8 @@ def _retrain(source: str) -> dict:
     a row is written to the training log. Not thread-safe; callers must hold
     ``_lock``.
     """
+    global classifier
+
     emails, stats = data_loader.load_dataset(DATA_DIR)
     raw_texts = [text for text, _ in emails]
     labels = [label for _, label in emails]
@@ -89,10 +92,20 @@ def _retrain(source: str) -> dict:
             "Not enough training data: need both ham and spam emails."
         )
 
+    classifier = SpamClassifier()
     train_stats = classifier.train(raw_texts, labels)
     train_stats["data"] = stats
     train_stats["feedback_incorporated"] = len(unapplied)
     train_stats["source"] = source
+
+    try:
+        classifier.save(MODEL_PATH)
+        train_stats["model_saved"] = True
+        train_stats["model_path"] = os.path.abspath(MODEL_PATH)
+    except Exception as exc:
+        train_stats["model_saved"] = False
+        train_stats["model_save_error"] = str(exc)
+        app.logger.warning("Failed to save model to %s: %s", MODEL_PATH, exc)
 
     database.mark_feedback_applied([fb["id"] for fb in unapplied])
     database.record_training(source, len(raw_texts), len(unapplied))
@@ -100,25 +113,57 @@ def _retrain(source: str) -> dict:
 
 
 def init_app() -> None:
-    """Prepare data and train the model before serving requests."""
+    """Prepare data and train or load the model before serving requests.
+
+    Tries to load a previously saved model from ``MODEL_PATH`` first. If the
+    model file is missing, corrupted, or cannot be loaded (e.g. joblib not
+    installed), falls back to training from scratch. After training, the model
+    is saved atomically so subsequent restarts are fast.
+    """
+    global classifier
+
     data_stats = _ensure_data()
     app.logger.info(
         "Training data ready: ham=%s spam=%s total=%s",
         data_stats["ham"], data_stats["spam"], data_stats["total"],
     )
-    with _lock:
-        stats = _retrain("startup")
-    app.logger.info(
-        "Model trained: vocabulary=%s features=%s feedback=%s",
-        stats["vocabulary_size"], stats["feature_count"],
-        stats["feedback_incorporated"],
-    )
+
+    loaded = False
+    if os.path.exists(MODEL_PATH):
+        try:
+            classifier = SpamClassifier.load(MODEL_PATH)
+            app.logger.info(
+                "Model loaded from %s: vocabulary=%s features=%s",
+                MODEL_PATH,
+                classifier.training_stats.get("vocabulary_size"),
+                classifier.training_stats.get("feature_count"),
+            )
+            loaded = True
+        except (FileNotFoundError, ValueError, RuntimeError, Exception) as exc:
+            app.logger.warning(
+                "Failed to load model from %s (%s), will retrain from scratch.",
+                MODEL_PATH, exc,
+            )
+            try:
+                os.unlink(MODEL_PATH)
+                app.logger.info("Removed corrupted model file %s", MODEL_PATH)
+            except OSError:
+                pass
+
+    if not loaded:
+        with _lock:
+            stats = _retrain("startup")
+        app.logger.info(
+            "Model trained: vocabulary=%s features=%s feedback=%s saved=%s",
+            stats["vocabulary_size"], stats["feature_count"],
+            stats["feedback_incorporated"], stats.get("model_saved"),
+        )
 
 
 def _extract_subject_body():
     """Read subject/body from a JSON or form-encoded request body."""
     data = request.get_json(silent=True)
-    if data is not None:
+    if isinstance(data, dict):
         subject = (data.get("subject") or "").strip()
         body = (data.get("body") or "").strip()
         return subject, body
@@ -146,7 +191,7 @@ def health():
 def predict():
     subject, body = _extract_subject_body()
     if not subject and not body:
-        return jsonify({"error": "Both 'subject' and 'body' are empty."}), 400
+        return jsonify({"error": "邮件内容不能为空"}), 400
 
     try:
         with _lock:
@@ -272,7 +317,7 @@ def predict_batch():
         body = (item.get("body") or "").strip()
         if not subject and not body:
             return jsonify({
-                "error": f"emails[{index}] has both subject and body empty."
+                "error": f"emails[{index}] 邮件内容不能为空"
             }), 400
         emails.append((subject, body))
 

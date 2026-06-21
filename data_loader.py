@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import tarfile
+import tempfile
 import urllib.request
 from email import message_from_string
 from typing import List, Tuple
@@ -152,7 +153,12 @@ def download_enron_dataset(
 
 
 def save_uploaded_email(data_dir: str, label: str, filename: str, content: str) -> str:
-    """Persist an uploaded email to ``data_dir/label/filename`` and return path."""
+    """Atomically persist an uploaded email to ``data_dir/label/filename``.
+
+    Writes to a temp file first, then renames atomically. If the write is
+    interrupted, only a temp file is left behind and the destination path
+    is untouched.
+    """
     if label not in ("ham", "spam"):
         raise ValueError("label must be 'ham' or 'spam'")
     folder = os.path.join(data_dir, label)
@@ -161,8 +167,22 @@ def save_uploaded_email(data_dir: str, label: str, filename: str, content: str) 
     if not safe_name.lower().endswith((".txt", ".eml")):
         safe_name += ".txt"
     path = os.path.join(folder, safe_name)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(content)
+
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".txt.tmp",
+        prefix=".upload_",
+        dir=folder,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -212,6 +232,25 @@ _HAM_TEMPLATES = [
     "Please verify the build passes on the integration branch before release.",
     "Subject: Books you recommended\n\nI picked up two of the books you suggested. "
     "Really enjoying the first one so far. We should discuss it over coffee.",
+    # Chinese ham samples
+    "Subject: 明天的会议提醒\n\n各位好，提醒一下明天上午10点的站会，请带上你们的周报。谢谢。",
+    "Subject: 这周五一起吃饭？\n\n嗨，想问下你这周五有空一起吃午饭吗？市中心开了一家新餐厅评价不错，有空告诉我哦。",
+    "Subject: 第三季度项目进度\n\n迁移工作进展顺利，我们已经完成了测试套件，周三将部署到预发布环境。目前没有阻塞问题。",
+    "Subject: 代码审核请求\n\n有空的时候能帮我看下合并请求吗？主要是给认证模块加了单元测试，多谢帮忙。",
+    "Subject: 请假通知\n\n我12号到20号不在公司，紧急事项请联系Susan。回来后会尽快回复邮件。",
+    "Subject: 昨天会议纪要\n\n附件是昨天规划会议的笔记，底部列出了行动事项，请查阅。",
+    "Subject: 订单确认\n\n感谢您的购买，您的4821号订单已发货，预计3个工作日内送达。可在官网查看物流。",
+    "Subject: 欢迎加入团队\n\n恭喜加入我们！下周一入职，HR会单独发送工牌和电脑领取信息。",
+    "Subject: 月度通讯\n\n本期内容：技术博客精选、设计师专访、近期社区活动。祝您阅读愉快。",
+    "Subject: 回复：关于报告的问题\n\n感谢发送，第4页的数据看起来没问题，我会把它们整合到幻灯片里。",
+    "Subject: 生日聚餐\n\n周四是Maria的生日，我们凑钱买礼物和蛋糕，想参加的请一起凑份子哈。",
+    "Subject: 服务器维护通知\n\n本周六凌晨2点到4点计划维护，升级期间服务可能短暂不可用。",
+    "Subject: 作业反馈\n\n第三次作业做得很棒，结构上有几个小建议，但整体是优秀的提交。继续加油！",
+    "Subject: 电话会议纪要\n\n我们同意推迟两周发布，市场部会相应调整活动日历。下周一同步。",
+    "Subject: 感谢介绍\n\n非常感谢牵线搭桥，这周我会联系他们，聊得怎么样会随时告诉你。",
+    "Subject: 这周一起健身？\n\n周二晚上你还去健身房吗？我想试试新课，几点方便告诉我。",
+    "Subject: 合并请求已合并\n\n你的改动已合并到主分支，请在发布前确认集成分支的构建通过。",
+    "Subject: 你推荐的书\n\n你推荐的书我买了两本，第一本很喜欢，有空一起喝咖啡聊聊。",
 ]
 
 _SPAM_TEMPLATES = [
@@ -268,6 +307,43 @@ _SPAM_TEMPLATES = [
     "Subject: Double your money in 7 days!!!\n\nExclusive opportunity!!! Double "
     "your money guaranteed in 7 days!!! Send Bitcoin to the address below and "
     "receive double back!!! Act fast!!! Limited spots!!!",
+    # Chinese spam samples
+    "Subject: 恭喜中奖！！！您获得100万元大奖\n\n尊敬的幸运用户！！！您已被选中参加本次国际抽奖活动！！！"
+    "立即点击领取您的百万大奖！！！只需支付99元手续费即可到账！！！机会有限！！！",
+    "Subject: 免费领取iPhone 15！限量速抢\n\n恭喜您！您已获得免费领取iPhone 15的资格！！！"
+    "点击链接立即领取，只需支付运费！库存有限，先到先得！！！不看后悔！",
+    "Subject: 在家兼职，日赚5000元！！！\n\n惊人机会！！！无需经验，在家操作，日赚5000元！！！"
+    "点击链接立即开始！！！这个秘密方法100%保证赚钱！！！",
+    "Subject: 【紧急】您的账户已被冻结，请立即验证\n\n尊敬的客户，我们检测到您的账户存在异常活动。"
+    "请点击以下链接验证您的密码和银行卡信息，24小时内不验证将永久冻结账户！！！",
+    "Subject: 无抵押贷款，当天到账！！！\n\n恭喜您！您已获得50万元贷款额度，无需抵押，不看征信！！！"
+    "回复个人信息，24小时内资金到账！！！利息低至0.1%！",
+    "Subject: 刷单刷信誉，日结佣金！！！\n\n想在家轻松赚钱吗？刷单刷信誉，每单佣金50-200元！！！"
+    "当天结算，多劳多得！！！名额有限，立即加入！！！",
+    "Subject: 您有百万红包待领取！！！\n\n恭喜！您获得了100万元红包返利！！！点击链接立即提现！！！"
+    "限时优惠，过期不候！！！速抢！！！",
+    "Subject: 正品手表一折促销！！！\n\n正品劳力士、欧米茄等名表一折促销！！！原价10万，现价9999！！！"
+    "库存有限，售完即止！！！全国包邮！！！立即点击购买！",
+    "Subject: 【官方通知】您的信用卡欠款逾期\n\n尊敬的用户，您的信用卡账单已逾期，请立即点击链接处理！！！"
+    "否则将影响您的征信记录！！！核实账户密码立即解冻！",
+    "Subject: 投资虚拟币，10倍收益保证！！！\n\n投资我们的币，保证1000%收益！！！机会难得，错过不再！！！"
+    "立即打款到以下钱包地址！！！马上翻倍！！！",
+    "Subject: 代开正规发票，点数优惠\n\n本公司代开各类正规发票，点数优惠，保真可查！！！"
+    "需要请联系，量大从优！！！长期合作更优惠！",
+    "Subject: 壮阳增大特效药，无效退款！！！\n\n神奇产品，100%有效！！！立即订购，买三送三！！！"
+    "无需处方，全国保密配送！！！限时特惠！！！",
+    "Subject: 您中了豪华游轮大奖！！！\n\n恭喜！！！您获得了免费豪华游轮双人游！！！"
+    "只需支付999元港口费即可领取！！！点击链接，截止日期前有效！！！",
+    "Subject: 美女同城交友，立即约见！！！\n\n附近单身美女想认识你！！！点击查看照片和联系方式！！！"
+    "100%真人，免费注册！！！立即开始聊天！！！",
+    "Subject: 【银行通知】您的积分可兑换现金\n\n尊敬的客户，您的银行卡积分可兑换5000元现金！！！"
+    "点击链接验证账户信息立即兑换！！！逾期清零！！！",
+    "Subject: 祛痘祛斑，7天见效！！！\n\n神奇美容产品，7天祛痘，30天祛斑！！！无效全额退款！！！"
+    "明星都在用！！！限时特价，立即购买！！！",
+    "Subject: 限量特价房，首付10万起\n\n市中心特价房源，首付仅10万起！！！升值潜力巨大！！！"
+    "点击了解详情，房源有限，先到先得！！！",
+    "Subject: 免费领取百万医疗险\n\n恭喜！您获得了免费百万医疗保险资格！！！点击链接立即领取！！！"
+    "只需提供身份信息，保障立即生效！！！",
 ]
 
 

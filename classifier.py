@@ -14,7 +14,9 @@ can be fed directly to a ``MultinomialNB`` classifier.
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -22,7 +24,19 @@ from scipy.sparse import csr_matrix, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 
+try:
+    import joblib
+    _JOBLIB_AVAILABLE = True
+except ImportError:
+    _JOBLIB_AVAILABLE = False
+
 from data_loader import parse_email
+
+try:
+    import jieba
+    _JIEBA_AVAILABLE = True
+except ImportError:
+    _JIEBA_AVAILABLE = False
 
 # Spam-suggestive keywords (matched case-insensitively, as whole tokens).
 _SPAM_KEYWORDS = (
@@ -30,6 +44,12 @@ _SPAM_KEYWORDS = (
     "urgent", "now", "congratulations", "lottery", "cash", "credit", "loan",
     "miracle", "amazing", "incredible", "risk", "selected", "limited",
     "offer", "discount", "deal", "money", "income", "profit", "bonus",
+    # Chinese spam keywords
+    "免费", "中奖", "恭喜", "优惠", "特价", "限时",
+    "点击", "立即", "贷款", "信用卡", "发票", "代开",
+    "赚钱", "兼职", "刷单", "提现", "转账", "密码",
+    "账户", "验证", "红包", "返利", "促销", "豪礼",
+    "百万", "千万", "大奖", "速抢", "不看后悔",
 )
 
 # Caps to keep numeric features in a range comparable with TF-IDF values.
@@ -43,6 +63,27 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _CURRENCY_RE = re.compile(r"[$€£¥]")
 _DIGIT_RE = re.compile(r"\d")
 _WORD_RE = re.compile(r"[A-Za-z]+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _mixed_tokenizer(text: str) -> List[str]:
+    """Tokenize text handling both Chinese and English.
+
+    Uses jieba for Chinese (and mixed) text when available, falling back to
+    English-only whitespace/regex tokenisation when jieba is not installed.
+    Tokens are lower-cased for consistent vocabulary matching.
+    """
+    lowered = text.lower()
+    if _JIEBA_AVAILABLE:
+        tokens = list(jieba.cut(lowered, cut_all=False))
+    else:
+        tokens = re.findall(r"[A-Za-z0-9]+", lowered)
+    return [t.strip() for t in tokens if t.strip()]
+
+
+def _has_chinese(text: str) -> bool:
+    """Return True if text contains any Chinese characters."""
+    return bool(_CJK_RE.search(text))
 
 
 def _safe_ratio(numerator: int, denominator: int) -> float:
@@ -128,7 +169,8 @@ class SpamClassifier:
     def __init__(self, alpha: float = 1.0) -> None:
         self.vectorizer = TfidfVectorizer(
             lowercase=True,
-            stop_words="english",
+            tokenizer=_mixed_tokenizer,
+            token_pattern=None,
             sublinear_tf=True,
             norm="l2",
             min_df=1,
@@ -241,3 +283,67 @@ class SpamClassifier:
             confidence = spam_proba if is_spam else (1.0 - spam_proba)
             results.append((is_spam, confidence))
         return results
+
+    # -- persistence -------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Atomically save the trained classifier to ``path``.
+
+        The save is interrupt-safe: the model is first written to a temporary
+        file in the same directory, then atomically renamed to ``path``. If the
+        process is killed mid-write, only the temp file is left behind; the
+        destination path is either untouched or replaced with a complete, valid
+        model.
+        """
+        if not self.is_trained:
+            raise RuntimeError("Cannot save an untrained classifier.")
+        if not _JOBLIB_AVAILABLE:
+            raise RuntimeError("joblib is required to save/load models.")
+
+        payload = {
+            "vectorizer": self.vectorizer,
+            "model": self.model,
+            "classes_": self.classes_,
+            "training_stats": self.training_stats,
+            "is_trained": True,
+        }
+
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".joblib.tmp",
+            prefix=".spam_model_",
+            dir=directory,
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                joblib.dump(payload, handle)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def load(cls, path: str) -> "SpamClassifier":
+        """Load a previously saved classifier from ``path``."""
+        if not _JOBLIB_AVAILABLE:
+            raise RuntimeError("joblib is required to save/load models.")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Model file not found: {path}")
+
+        payload = joblib.load(path)
+        required = ("vectorizer", "model", "classes_", "training_stats")
+        for key in required:
+            if key not in payload:
+                raise ValueError(f"Corrupted model file: missing '{key}'")
+
+        instance = cls()
+        instance.vectorizer = payload["vectorizer"]
+        instance.model = payload["model"]
+        instance.classes_ = payload["classes_"]
+        instance.training_stats = payload["training_stats"]
+        instance.is_trained = bool(payload.get("is_trained", True))
+        return instance
