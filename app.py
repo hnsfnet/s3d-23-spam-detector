@@ -2,10 +2,13 @@
 
 Endpoints
 ---------
-GET  /           health check + model status
-POST /predict    classify a single email (subject + body)
-POST /train      add new training data and retrain the model
-GET  /history    browse stored prediction history
+GET  /               health check + model status
+POST /predict        classify a single email (subject + body)
+POST /predict_batch  classify many emails in one request
+POST /train          add new training data and retrain the model
+POST /feedback       correct a prediction; auto-retrains after enough feedback
+GET  /history        browse stored prediction history
+GET  /stats          dashboard statistics (totals, spam ratio, accuracy)
 
 On startup the service loads every email under ``data/`` (ham/spam folders),
 retraining the Naive Bayes model. If no data is present it first tries to
@@ -17,16 +20,19 @@ from __future__ import annotations
 
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask, jsonify, request
 
 import data_loader
 from classifier import SpamClassifier
-from database import PredictionDatabase
+from database import PredictionDatabase, VALID_LABELS
 
 DATA_DIR = os.environ.get("SPAM_DATA_DIR", "data")
 DB_PATH = os.environ.get("SPAM_DB_PATH", "spam_predictions.db")
+# Number of new, unapplied feedback records that trigger an automatic
+# retraining so the model "learns" from user corrections.
+FEEDBACK_RETRAIN_THRESHOLD = 50
 
 app = Flask(__name__)
 
@@ -56,17 +62,40 @@ def _ensure_data() -> dict:
     return stats
 
 
-def _train_from_disk() -> dict:
-    """Load all data from disk and (re)train the classifier. Not thread-safe."""
+def _retrain(source: str) -> dict:
+    """Reload all disk data plus any unapplied feedback, then retrain.
+
+    User feedback is folded in by reconstructing a ``Subject: ...`` email from
+    each corrected (subject, body) pair so it shares the same parsing path as
+    corpus emails. After training, the consumed feedback is marked applied and
+    a row is written to the training log. Not thread-safe; callers must hold
+    ``_lock``.
+    """
     emails, stats = data_loader.load_dataset(DATA_DIR)
-    if not emails or stats["ham"] == 0 or stats["spam"] == 0:
+    raw_texts = [text for text, _ in emails]
+    labels = [label for _, label in emails]
+
+    unapplied = database.get_unapplied_feedback()
+    for fb in unapplied:
+        raw_texts.append(f"Subject: {fb['subject']}\n\n{fb['body']}")
+        labels.append(fb["correct_label"])
+
+    if not raw_texts:
+        raise RuntimeError("Not enough training data: need at least one email.")
+
+    label_set = {str(l).lower() for l in labels}
+    if not {"ham", "spam"}.issubset(label_set):
         raise RuntimeError(
             "Not enough training data: need both ham and spam emails."
         )
-    raw_texts = [text for text, _ in emails]
-    labels = [label for _, label in emails]
+
     train_stats = classifier.train(raw_texts, labels)
     train_stats["data"] = stats
+    train_stats["feedback_incorporated"] = len(unapplied)
+    train_stats["source"] = source
+
+    database.mark_feedback_applied([fb["id"] for fb in unapplied])
+    database.record_training(source, len(raw_texts), len(unapplied))
     return train_stats
 
 
@@ -78,10 +107,11 @@ def init_app() -> None:
         data_stats["ham"], data_stats["spam"], data_stats["total"],
     )
     with _lock:
-        stats = _train_from_disk()
+        stats = _retrain("startup")
     app.logger.info(
-        "Model trained: vocabulary=%s features=%s",
+        "Model trained: vocabulary=%s features=%s feedback=%s",
         stats["vocabulary_size"], stats["feature_count"],
+        stats["feedback_incorporated"],
     )
 
 
@@ -105,7 +135,10 @@ def health():
         "status": "ok",
         "model_trained": classifier.is_trained,
         "training_stats": classifier.training_stats,
+        "last_training": database.get_last_training(),
         "predictions_logged": database.count(),
+        "feedback_total": database.count_feedback(),
+        "feedback_unapplied": database.count_unapplied_feedback(),
     })
 
 
@@ -177,7 +210,7 @@ def train():
 
     try:
         with _lock:
-            stats = _train_from_disk()
+            stats = _retrain("train_api")
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -202,6 +235,181 @@ def history():
         "offset": offset,
         "records": database.get_history(limit=limit, offset=offset),
     })
+
+
+@app.route("/predict_batch", methods=["POST"])
+def predict_batch():
+    """Classify many emails in a single request using one model pass.
+
+    Request body (JSON)::
+
+        {"emails": [{"subject": "...", "body": "..."}, ...]}
+
+    A bare list ``[{...}, ...]`` is also accepted. Every email is classified
+    in one batch (one feature matrix, one ``predict_proba`` call) and each
+    result is persisted to history just like ``/predict``.
+    """
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        emails_payload = payload.get("emails")
+    elif isinstance(payload, list):
+        emails_payload = payload
+    else:
+        emails_payload = None
+
+    if not isinstance(emails_payload, list) or not emails_payload:
+        return jsonify({
+            "error": "Provide a non-empty 'emails' list of {subject, body}."
+        }), 400
+
+    emails = []
+    for index, item in enumerate(emails_payload):
+        if not isinstance(item, dict):
+            return jsonify({
+                "error": f"emails[{index}] must be an object with subject/body."
+            }), 400
+        subject = (item.get("subject") or "").strip()
+        body = (item.get("body") or "").strip()
+        if not subject and not body:
+            return jsonify({
+                "error": f"emails[{index}] has both subject and body empty."
+            }), 400
+        emails.append((subject, body))
+
+    try:
+        with _lock:
+            results = classifier.predict_batch(emails)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+    serialized = []
+    for (subject, body), (is_spam, confidence) in zip(emails, results):
+        database.save_prediction(subject, body, is_spam, confidence)
+        serialized.append({
+            "index": len(serialized),
+            "subject": subject,
+            "is_spam": bool(is_spam),
+            "confidence": round(float(confidence), 6),
+            "label": "spam" if is_spam else "ham",
+        })
+
+    spam_count = sum(1 for r in serialized if r["is_spam"])
+    return jsonify({
+        "count": len(serialized),
+        "spam_count": spam_count,
+        "ham_count": len(serialized) - spam_count,
+        "results": serialized,
+    })
+
+
+@app.route("/feedback", methods=["POST"])
+def feedback():
+    """Submit a correction for a prediction.
+
+    Accepted JSON shapes::
+
+        {"prediction_id": 12, "correct_label": "ham"}
+        {"subject": "...", "body": "...", "correct_label": "spam"}
+
+    When ``prediction_id`` is given the stored prediction supplies the
+    subject/body and the model's original label. Otherwise the subject/body
+    are taken from the request and the model is queried for its current label
+    so that accuracy can be measured. Once the number of unapplied feedback
+    records reaches ``FEEDBACK_RETRAIN_THRESHOLD`` the model is retrained
+    automatically with the feedback folded in.
+    """
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+
+    correct_label = (payload.get("correct_label") or "").strip().lower()
+    if correct_label not in VALID_LABELS:
+        return jsonify({
+            "error": "'correct_label' must be 'spam' or 'ham'."
+        }), 400
+
+    prediction_id = payload.get("prediction_id")
+    subject = body = ""
+    predicted_label = None
+
+    if prediction_id is not None:
+        try:
+            prediction_id = int(prediction_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "'prediction_id' must be an integer."}), 400
+        record = database.get_prediction(prediction_id)
+        if record is None:
+            return jsonify({"error": f"prediction_id {prediction_id} not found."}), 404
+        subject = record["subject"] or ""
+        body = record["body"] or ""
+        predicted_label = "spam" if record["is_spam"] else "ham"
+    else:
+        subject = (payload.get("subject") or "").strip()
+        body = (payload.get("body") or "").strip()
+        if not subject and not body:
+            return jsonify({
+                "error": "Provide 'prediction_id' or a non-empty 'subject'/'body'."
+            }), 400
+        try:
+            with _lock:
+                is_spam, _ = classifier.predict(subject, body)
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 503
+        predicted_label = "spam" if is_spam else "ham"
+
+    feedback_id = database.save_feedback(
+        subject=subject,
+        body=body,
+        predicted_label=predicted_label,
+        correct_label=correct_label,
+        prediction_id=prediction_id,
+    )
+
+    retrain_result = None
+    retrain_error = None
+    with _lock:
+        if database.count_unapplied_feedback() >= FEEDBACK_RETRAIN_THRESHOLD:
+            try:
+                retrain_result = _retrain("feedback_auto")
+            except RuntimeError as exc:
+                retrain_error = str(exc)
+
+    response = {
+        "status": "recorded",
+        "feedback_id": feedback_id,
+        "predicted_label": predicted_label,
+        "correct_label": correct_label,
+        "corrected": predicted_label != correct_label,
+        "unapplied_feedback": database.count_unapplied_feedback(),
+    }
+    if retrain_result is not None:
+        response["auto_retrained"] = True
+        response["retrain_stats"] = retrain_result
+    elif retrain_error is not None:
+        response["auto_retrained"] = False
+        response["retrain_error"] = retrain_error
+    else:
+        response["auto_retrained"] = False
+        response["retrain_threshold"] = FEEDBACK_RETRAIN_THRESHOLD
+    return jsonify(response)
+
+
+@app.route("/stats", methods=["GET"])
+def stats():
+    """Dashboard statistics over a recent window (default 7 days)."""
+    try:
+        days = int(request.args.get("days", 7))
+    except ValueError:
+        return jsonify({"error": "'days' must be an integer."}), 400
+    days = max(1, min(days, 3650))
+    since_iso = (datetime.utcnow() - timedelta(days=days)).isoformat(
+        timespec="seconds"
+    )
+    data = database.get_stats(since_iso=since_iso)
+    data["window_days"] = days
+    data["model_trained"] = classifier.is_trained
+    data["training_stats"] = classifier.training_stats
+    return jsonify(data)
 
 
 if __name__ == "__main__":

@@ -214,3 +214,30 @@ class SpamClassifier:
         is_spam = spam_proba >= 0.5
         confidence = spam_proba if is_spam else (1.0 - spam_proba)
         return is_spam, confidence
+
+    def predict_batch(
+        self, emails: List[Tuple[str, str]]
+    ) -> List[Tuple[bool, float]]:
+        """Classify many emails in one pass, reusing the trained model.
+
+        A single feature matrix is built and a single ``predict_proba`` call
+        is made, which is far cheaper than looping over ``predict`` when the
+        batch is large.
+        """
+        if not self.is_trained:
+            raise RuntimeError("Classifier is not trained yet.")
+        if not emails:
+            return []
+
+        subjects = [s for s, _ in emails]
+        bodies = [b for _, b in emails]
+        x = self._build_matrix(subjects, bodies, [{} for _ in emails], fit=False)
+        proba = self.model.predict_proba(x)
+        spam_index = self.classes_.index(1)
+        results: List[Tuple[bool, float]] = []
+        for row in proba:
+            spam_proba = float(row[spam_index])
+            is_spam = spam_proba >= 0.5
+            confidence = spam_proba if is_spam else (1.0 - spam_proba)
+            results.append((is_spam, confidence))
+        return results
