@@ -1,0 +1,3 @@
+Subject: Q3 project update
+
+The migration is on track. We finished the test suite and will deploy to staging on Wednesday. No blockers so far.

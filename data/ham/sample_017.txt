@@ -1,0 +1,3 @@
+Subject: Pull request merged
+
+Your changes have been merged into main. Please verify the build passes on the integration branch before release.
