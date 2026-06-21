@@ -18,6 +18,7 @@ except ImportError:
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
+_PUNCT_RE = re.compile(r"^[^\w\u4e00-\u9fff]+$")
 
 
 def has_chinese(text: str) -> bool:
@@ -41,7 +42,7 @@ def tokenize(text: str) -> List[str]:
         tokens = list(jieba.cut(lowered, cut_all=False))
     else:
         tokens = _WORD_RE.findall(lowered)
-    return [t.strip() for t in tokens if t.strip()]
+    return [t.strip() for t in tokens if t.strip() and not _PUNCT_RE.match(t.strip())]
 
 
 def clean_text(text: str) -> str:
