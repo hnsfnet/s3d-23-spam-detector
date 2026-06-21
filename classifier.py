@@ -1,218 +1,73 @@
-"""Naive Bayes spam classifier with hand-crafted email feature extraction.
+"""Spam classifier abstraction and concrete implementations.
 
-The classifier combines two kinds of features:
-
-* **Text features** -- TF-IDF over the lower-cased subject + body, which
-  captures word-frequency signals (the classic bag-of-words approach).
-* **Numeric features** -- engineered counts and ratios that are strong spam
-  indicators: exclamation/dollar/percent counts, uppercase and digit ratios,
-  URL/HTML tag counts, spam keywords, and email-header signals.
-
-Both feature groups are non-negative and scaled to comparable ranges, so they
-can be fed directly to a ``MultinomialNB`` classifier.
+The ``BaseClassifier`` defines the interface every classifier must satisfy.
+``NaiveBayesClassifier`` is the Multinomial Naive Bayes implementation.
+``create_classifier()`` is the factory that returns a classifier by type name,
+making it easy to add new algorithms without touching the rest of the codebase.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import tempfile
+from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
 
 import numpy as np
-from scipy.sparse import csr_matrix, hstack
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.naive_bayes import MultinomialNB
+
+import config
+from data_loader import parse_email
+from feature_extractor import FeatureExtractor
 
 try:
     import joblib
-    _JOBLIB_AVAILABLE = True
+    JOBLIB_AVAILABLE = True
 except ImportError:
-    _JOBLIB_AVAILABLE = False
-
-from data_loader import parse_email
-
-try:
-    import jieba
-    _JIEBA_AVAILABLE = True
-except ImportError:
-    _JIEBA_AVAILABLE = False
-
-# Spam-suggestive keywords (matched case-insensitively, as whole tokens).
-_SPAM_KEYWORDS = (
-    "free", "win", "winner", "prize", "guarantee", "guaranteed", "click",
-    "urgent", "now", "congratulations", "lottery", "cash", "credit", "loan",
-    "miracle", "amazing", "incredible", "risk", "selected", "limited",
-    "offer", "discount", "deal", "money", "income", "profit", "bonus",
-    # Chinese spam keywords
-    "免费", "中奖", "恭喜", "优惠", "特价", "限时",
-    "点击", "立即", "贷款", "信用卡", "发票", "代开",
-    "赚钱", "兼职", "刷单", "提现", "转账", "密码",
-    "账户", "验证", "红包", "返利", "促销", "豪礼",
-    "百万", "千万", "大奖", "速抢", "不看后悔",
-)
-
-# Caps to keep numeric features in a range comparable with TF-IDF values.
-_CAP_COUNT = 20.0
-_CAP_LENGTH = 5000.0
-_CAP_HEADERS = 20.0
-
-# Patterns reused across emails.
-_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_CURRENCY_RE = re.compile(r"[$€£¥]")
-_DIGIT_RE = re.compile(r"\d")
-_WORD_RE = re.compile(r"[A-Za-z]+")
-_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+    JOBLIB_AVAILABLE = False
 
 
-def _mixed_tokenizer(text: str) -> List[str]:
-    """Tokenize text handling both Chinese and English.
+class BaseClassifier(ABC):
+    """Abstract base class for spam classifiers.
 
-    Uses jieba for Chinese (and mixed) text when available, falling back to
-    English-only whitespace/regex tokenisation when jieba is not installed.
-    Tokens are lower-cased for consistent vocabulary matching.
+    Every concrete classifier must be trainable from raw email texts, able to
+    predict spam/ham for single and batch inputs, and support atomic
+    save/load for persistence.
     """
-    lowered = text.lower()
-    if _JIEBA_AVAILABLE:
-        tokens = list(jieba.cut(lowered, cut_all=False))
-    else:
-        tokens = re.findall(r"[A-Za-z0-9]+", lowered)
-    return [t.strip() for t in tokens if t.strip()]
 
+    is_trained: bool
+    classes_: List[int]
+    training_stats: Dict[str, int]
 
-def _has_chinese(text: str) -> bool:
-    """Return True if text contains any Chinese characters."""
-    return bool(_CJK_RE.search(text))
+    @abstractmethod
+    def train(self, raw_texts: List[str], labels: List[str]) -> Dict[str, int]:
+        """Train on raw email texts with ``'ham'``/``'spam'`` labels."""
+        ...
 
+    @abstractmethod
+    def predict(self, subject: str, body: str) -> Tuple[bool, float]:
+        """Return ``(is_spam, confidence)`` for a single email."""
+        ...
 
-def _safe_ratio(numerator: int, denominator: int) -> float:
-    """Ratio clamped to [0, 1]; returns 0.0 when the denominator is 0."""
-    if denominator <= 0:
-        return 0.0
-    return min(max(numerator / denominator, 0.0), 1.0)
+    @abstractmethod
+    def predict_batch(
+        self, emails: List[Tuple[str, str]]
+    ) -> List[Tuple[bool, float]]:
+        """Classify many ``(subject, body)`` pairs in one pass."""
+        ...
 
+    @abstractmethod
+    def save(self, path: str) -> None:
+        """Atomically save the trained classifier to ``path``."""
+        ...
 
-def extract_numeric_features(subject: str, body: str, headers: dict) -> List[float]:
-    """Return a fixed-length list of engineered, scaled numeric features.
-
-    Every value lies in [0, 1] so the numeric block stays comparable in
-    magnitude to the TF-IDF block, preventing length-style features from
-    drowning out the text signal in the Naive Bayes model.
-    """
-    text = f"{subject}\n{body}"
-
-    exclamations = text.count("!")
-    dollars = len(_CURRENCY_RE.findall(text))
-    percents = text.count("%")
-    digits = len(_DIGIT_RE.findall(text))
-    uppercase_letters = sum(1 for ch in text if ch.isupper())
-    total_letters = sum(1 for ch in text if ch.isalpha())
-
-    words = _WORD_RE.findall(text)
-    total_words = len(words)
-    caps_words = sum(1 for w in words if len(w) >= 3 and w.isupper())
-
-    urls = len(_URL_RE.findall(text))
-    html_tags = len(_HTML_TAG_RE.findall(text))
-    has_html = 1.0 if html_tags > 0 else 0.0
-
-    lowered = text.lower()
-    keyword_hits = sum(lowered.count(kw) for kw in _SPAM_KEYWORDS)
-
-    subject_letters = sum(1 for ch in subject if ch.isalpha())
-    subject_upper = sum(1 for ch in subject if ch.isupper())
-    subject_caps_ratio = _safe_ratio(subject_upper, subject_letters)
-
-    body_length = len(body)
-
-    features = [
-        min(exclamations, _CAP_COUNT) / _CAP_COUNT,           # exclamation density
-        min(dollars, _CAP_COUNT) / _CAP_COUNT,                # currency symbols
-        min(percents, _CAP_COUNT) / _CAP_COUNT,               # percent signs
-        _safe_ratio(uppercase_letters, total_letters),        # uppercase ratio
-        _safe_ratio(caps_words, total_words),                 # ALL-CAPS word ratio
-        _safe_ratio(digits, max(len(text), 1)),                # digit ratio
-        min(urls, _CAP_COUNT) / _CAP_COUNT,                   # url count
-        min(html_tags, _CAP_COUNT) / _CAP_COUNT,              # html tag count
-        has_html,                                              # has html flag
-        min(keyword_hits, _CAP_COUNT) / _CAP_COUNT,           # spam keyword hits
-        subject_caps_ratio,                                    # subject caps ratio
-        min(body_length, _CAP_LENGTH) / _CAP_LENGTH,          # body length
-        1.0 if headers.get("Reply-To") else 0.0,              # reply-to present
-        min(len(headers), _CAP_HEADERS) / _CAP_HEADERS,       # header count
-    ]
-    return features
-
-
-NUMERIC_FEATURE_NAMES = [
-    "exclamation_density",
-    "currency_symbols",
-    "percent_signs",
-    "uppercase_ratio",
-    "caps_word_ratio",
-    "digit_ratio",
-    "url_count",
-    "html_tag_count",
-    "has_html",
-    "spam_keyword_hits",
-    "subject_caps_ratio",
-    "body_length",
-    "has_reply_to",
-    "header_count",
-]
-
-
-class SpamClassifier:
-    """Multinomial Naive Bayes spam classifier."""
-
-    def __init__(self, alpha: float = 1.0) -> None:
-        self.vectorizer = TfidfVectorizer(
-            lowercase=True,
-            tokenizer=_mixed_tokenizer,
-            token_pattern=None,
-            sublinear_tf=True,
-            norm="l2",
-            min_df=1,
-            max_df=0.95,
-            ngram_range=(1, 2),
-        )
-        self.model = MultinomialNB(alpha=alpha)
-        self.is_trained = False
-        self.classes_: List[int] = []
-        self.training_stats: Dict[str, int] = {}
-
-    # -- internal helpers -------------------------------------------------
+    @classmethod
+    @abstractmethod
+    def load(cls, path: str) -> "BaseClassifier":
+        """Load a previously saved classifier from ``path``."""
+        ...
 
     @staticmethod
-    def _document(subject: str, body: str) -> str:
-        return f"{subject}\n{body}".lower()
-
-    def _build_matrix(
-        self, subjects, bodies, headers_list, fit: bool
-    ) -> csr_matrix:
-        documents = [self._document(s, b) for s, b in zip(subjects, bodies)]
-        numeric = np.asarray(
-            [
-                extract_numeric_features(s, b, h)
-                for s, b, h in zip(subjects, bodies, headers_list)
-            ],
-            dtype=np.float64,
-        )
-        if fit:
-            x_text = self.vectorizer.fit_transform(documents)
-        else:
-            x_text = self.vectorizer.transform(documents)
-        x_num = csr_matrix(numeric)
-        return hstack([x_text, x_num], format="csr")
-
-    # -- public API -------------------------------------------------------
-
-    def train(self, raw_texts: List[str], labels: List[str]) -> Dict[str, int]:
-        """Train on a list of raw email texts and ``'ham'``/``'spam'`` labels."""
-        if not raw_texts:
-            raise ValueError("Cannot train on an empty dataset.")
-
+    def _parse_emails(raw_texts: List[str]) -> Tuple[List[str], List[str], List[dict]]:
         subjects: List[str] = []
         bodies: List[str] = []
         headers_list: List[dict] = []
@@ -221,93 +76,25 @@ class SpamClassifier:
             subjects.append(subject)
             bodies.append(body)
             headers_list.append(headers)
+        return subjects, bodies, headers_list
 
-        y = np.array([1 if str(l).lower() == "spam" else 0 for l in labels])
-        if len(set(y)) < 2:
-            raise ValueError("Training data must contain both ham and spam.")
+    @staticmethod
+    def _labels_to_y(labels: List[str]) -> np.ndarray:
+        return np.array([1 if str(l).lower() == "spam" else 0 for l in labels])
 
-        x = self._build_matrix(subjects, bodies, headers_list, fit=True)
-        self.model.fit(x, y)
-        self.classes_ = list(self.model.classes_)
-        self.is_trained = True
-
-        self.training_stats = {
-            "total": len(raw_texts),
-            "ham": int(np.sum(y == 0)),
-            "spam": int(np.sum(y == 1)),
-            "vocabulary_size": int(len(self.vectorizer.vocabulary_)),
-            "feature_count": int(x.shape[1]),
-        }
-        return self.training_stats
-
-    def predict(self, subject: str, body: str) -> Tuple[bool, float]:
-        """Return ``(is_spam, confidence)`` for a single email.
-
-        ``confidence`` is the probability the model assigns to the predicted
-        class, always in the range [0, 1].
-        """
-        if not self.is_trained:
-            raise RuntimeError("Classifier is not trained yet.")
-
-        x = self._build_matrix([subject], [body], [{}], fit=False)
-        proba = self.model.predict_proba(x)[0]
-        spam_index = self.classes_.index(1)
-        spam_proba = float(proba[spam_index])
+    @staticmethod
+    def _proba_to_result(prob_row: np.ndarray, classes_: List[int]) -> Tuple[bool, float]:
+        spam_index = classes_.index(1)
+        spam_proba = float(prob_row[spam_index])
         is_spam = spam_proba >= 0.5
         confidence = spam_proba if is_spam else (1.0 - spam_proba)
         return is_spam, confidence
 
-    def predict_batch(
-        self, emails: List[Tuple[str, str]]
-    ) -> List[Tuple[bool, float]]:
-        """Classify many emails in one pass, reusing the trained model.
-
-        A single feature matrix is built and a single ``predict_proba`` call
-        is made, which is far cheaper than looping over ``predict`` when the
-        batch is large.
-        """
-        if not self.is_trained:
-            raise RuntimeError("Classifier is not trained yet.")
-        if not emails:
-            return []
-
-        subjects = [s for s, _ in emails]
-        bodies = [b for _, b in emails]
-        x = self._build_matrix(subjects, bodies, [{} for _ in emails], fit=False)
-        proba = self.model.predict_proba(x)
-        spam_index = self.classes_.index(1)
-        results: List[Tuple[bool, float]] = []
-        for row in proba:
-            spam_proba = float(row[spam_index])
-            is_spam = spam_proba >= 0.5
-            confidence = spam_proba if is_spam else (1.0 - spam_proba)
-            results.append((is_spam, confidence))
-        return results
-
-    # -- persistence -------------------------------------------------------
-
-    def save(self, path: str) -> None:
-        """Atomically save the trained classifier to ``path``.
-
-        The save is interrupt-safe: the model is first written to a temporary
-        file in the same directory, then atomically renamed to ``path``. If the
-        process is killed mid-write, only the temp file is left behind; the
-        destination path is either untouched or replaced with a complete, valid
-        model.
-        """
-        if not self.is_trained:
-            raise RuntimeError("Cannot save an untrained classifier.")
-        if not _JOBLIB_AVAILABLE:
+    @staticmethod
+    def _atomic_save(payload: dict, path: str) -> None:
+        """Write ``payload`` to ``path`` atomically using temp + rename."""
+        if not JOBLIB_AVAILABLE:
             raise RuntimeError("joblib is required to save/load models.")
-
-        payload = {
-            "vectorizer": self.vectorizer,
-            "model": self.model,
-            "classes_": self.classes_,
-            "training_stats": self.training_stats,
-            "is_trained": True,
-        }
-
         directory = os.path.dirname(os.path.abspath(path))
         os.makedirs(directory, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
@@ -326,24 +113,153 @@ class SpamClassifier:
                 pass
             raise
 
-    @classmethod
-    def load(cls, path: str) -> "SpamClassifier":
-        """Load a previously saved classifier from ``path``."""
-        if not _JOBLIB_AVAILABLE:
+    @staticmethod
+    def _atomic_load(path: str, required_keys: Tuple[str, ...]) -> dict:
+        if not JOBLIB_AVAILABLE:
             raise RuntimeError("joblib is required to save/load models.")
         if not os.path.exists(path):
             raise FileNotFoundError(f"Model file not found: {path}")
-
         payload = joblib.load(path)
-        required = ("vectorizer", "model", "classes_", "training_stats")
-        for key in required:
+        for key in required_keys:
             if key not in payload:
                 raise ValueError(f"Corrupted model file: missing '{key}'")
+        return payload
 
+
+class NaiveBayesClassifier(BaseClassifier):
+    """Multinomial Naive Bayes spam classifier.
+
+    Combines TF-IDF text features with engineered numeric features, both of
+    which are non-negative and well-suited to MultinomialNB.
+    """
+
+    classifier_type = "naive_bayes"
+
+    def __init__(self, alpha: float | None = None) -> None:
+        from sklearn.naive_bayes import MultinomialNB
+        self.features = FeatureExtractor()
+        self.model = MultinomialNB(alpha=alpha if alpha is not None else config.NB_ALPHA)
+        self.is_trained = False
+        self.classes_: List[int] = []
+        self.training_stats: Dict[str, int] = {}
+
+    # -- training ---------------------------------------------------------
+
+    def train(self, raw_texts: List[str], labels: List[str]) -> Dict[str, int]:
+        if not raw_texts:
+            raise ValueError("Cannot train on an empty dataset.")
+
+        subjects, bodies, headers_list = self._parse_emails(raw_texts)
+        y = self._labels_to_y(labels)
+        if len(set(y)) < 2:
+            raise ValueError("Training data must contain both ham and spam.")
+
+        x = self.features.fit_transform(subjects, bodies, headers_list)
+        self.model.fit(x, y)
+        self.classes_ = list(self.model.classes_)
+        self.is_trained = True
+
+        self.training_stats = {
+            "total": len(raw_texts),
+            "ham": int(np.sum(y == 0)),
+            "spam": int(np.sum(y == 1)),
+            "vocabulary_size": self.features.vocabulary_size,
+            "feature_count": self.features.feature_count,
+            "classifier_type": self.classifier_type,
+        }
+        return self.training_stats
+
+    # -- prediction --------------------------------------------------
+
+    def predict(self, subject: str, body: str) -> Tuple[bool, float]:
+        if not self.is_trained:
+            raise RuntimeError("Classifier is not trained yet.")
+        x = self.features.transform([subject], [body], [{}])
+        proba = self.model.predict_proba(x)[0]
+        return self._proba_to_result(proba, self.classes_)
+
+    def predict_batch(
+        self, emails: List[Tuple[str, str]]
+    ) -> List[Tuple[bool, float]]:
+        if not self.is_trained:
+            raise RuntimeError("Classifier is not trained yet.")
+        if not emails:
+            return []
+        subjects = [s for s, _ in emails]
+        bodies = [b for _, b in emails]
+        headers_list = [{} for _ in emails]
+        x = self.features.transform(subjects, bodies, headers_list)
+        proba = self.model.predict_proba(x)
+        return [self._proba_to_result(row, self.classes_) for row in proba]
+
+    # -- persistence -------------------------------------------------
+
+    def save(self, path: str) -> None:
+        if not self.is_trained:
+            raise RuntimeError("Cannot save an untrained classifier.")
+        payload = {
+            "classifier_type": self.classifier_type,
+            "features": self.features.to_dict(),
+            "model": self.model,
+            "classes_": self.classes_,
+            "training_stats": self.training_stats,
+            "is_trained": True,
+        }
+        self._atomic_save(payload, path)
+
+    @classmethod
+    def load(cls, path: str) -> "NaiveBayesClassifier":
+        required = ("classifier_type", "features", "model", "classes_", "training_stats")
+        payload = cls._atomic_load(path, required)
+        ctype = payload.get("classifier_type")
+        if ctype != "naive_bayes":
+            raise ValueError(f"Model has unexpected classifier_type: {ctype}")
         instance = cls()
-        instance.vectorizer = payload["vectorizer"]
+        instance.features = FeatureExtractor.from_dict(payload["features"])
         instance.model = payload["model"]
         instance.classes_ = payload["classes_"]
         instance.training_stats = payload["training_stats"]
         instance.is_trained = bool(payload.get("is_trained", True))
         return instance
+
+
+_CLASSIFIER_REGISTRY = {
+    "naive_bayes": NaiveBayesClassifier,
+}
+
+
+def create_classifier(classifier_type: str | None = None) -> BaseClassifier:
+    """Factory: return a new untrained classifier of the requested type.
+
+    ``classifier_type`` defaults to ``config.CLASSIFIER_TYPE``. Raises
+    ``ValueError`` when the type is not registered.
+    """
+    ctype = classifier_type or config.CLASSIFIER_TYPE
+    cls = _CLASSIFIER_REGISTRY.get(ctype)
+    if cls is None:
+        raise ValueError(
+            f"Unknown classifier_type '{ctype}'. "
+            f"Available: {', '.join(_CLASSIFIER_REGISTRY)}"
+        )
+    return cls()
+
+
+def load_classifier(path: str) -> BaseClassifier:
+    """Load a saved classifier from ``path``, dispatching by stored type."""
+    if not JOBLIB_AVAILABLE:
+        raise RuntimeError("joblib is required to save/load models.")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model file not found: {path}")
+    payload = joblib.load(path)
+    ctype = payload.get("classifier_type", "naive_bayes")
+    cls = _CLASSIFIER_REGISTRY.get(ctype)
+    if cls is None:
+        raise ValueError(f"Unknown saved classifier_type '{ctype}'")
+    return cls.load(path)
+
+
+def register_classifier(name: str, cls: type) -> None:
+    """Register a new classifier implementation (for plugins / future extensions)."""
+    if not issubclass(cls, BaseClassifier):
+        raise TypeError("Classifier must subclass BaseClassifier")
+    _CLASSIFIER_REGISTRY[name] = cls
